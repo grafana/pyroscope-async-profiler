@@ -101,6 +101,8 @@ public class JfrToOtlp extends JfrConverter {
     @Override
     public void convert() throws IOException {
         long rpMark = proto.startField(PROFILES_DATA_resource_profiles, MSG_LARGE);
+        writeResource();
+
         long spMark = proto.startField(RESOURCE_PROFILES_scope_profiles, MSG_LARGE);
         super.convert();
         proto.commitField(spMark);
@@ -115,8 +117,7 @@ public class JfrToOtlp extends JfrConverter {
 
         long sttMark = proto.startField(PROFILE_sample_type, MSG_SMALL);
         proto.field(VALUE_TYPE_type_strindex, stringPool.index(getValueType()));
-        proto.field(VALUE_TYPE_unit_strindex,
-                    stringPool.index(args.total ? getTotalUnits() : getSampleUnits()));
+        proto.field(VALUE_TYPE_unit_strindex, stringPool.index(args.total ? getTotalUnits() : getSampleUnits()));
         proto.commitField(sttMark);
 
         long ptMark = proto.startField(PROFILE_period_type, MSG_SMALL);
@@ -135,6 +136,22 @@ public class JfrToOtlp extends JfrConverter {
         });
 
         proto.commitField(pMark);
+    }
+
+    private void writeResource() {
+        String serviceName = System.getProperty("otel.service.name");
+        if (serviceName == null || serviceName.isEmpty()) {
+            return;
+        }
+
+        long rMark = proto.startField(RESOURCE_PROFILES_resource, MSG_LARGE);
+        long aMark = proto.startField(RESOURCE_attributes, MSG_LARGE);
+        proto.field(KEY_VALUE_key, OTLP_SERVICE_NAME);
+        long vMark = proto.startField(KEY_VALUE_value, MSG_LARGE);
+        proto.field(ANY_VALUE_string_value, serviceName);
+        proto.commitField(vMark);
+        proto.commitField(aMark);
+        proto.commitField(rMark);
     }
 
     private long getPeriod() {

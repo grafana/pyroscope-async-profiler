@@ -28,6 +28,7 @@ enum EventType {
     PROFILING_WINDOW,
     SPAN,
     USER_EVENT,
+    EVENT_TYPES
 };
 
 class Event {
@@ -35,9 +36,21 @@ class Event {
     u64 _start_time;
 };
 
-class EventWithClassId : public Event {
+class EventWithClass : public Event {
+  private:
+    const char* _class_name;
+    u32 _class_name_len;
+
   public:
-    u32 _class_id;
+    EventWithClass() : _class_name(nullptr) {}
+
+    void setClassName(const char* class_name, u32 len);
+    void setClassSignature(const char* class_sig);
+
+    // Must be called under the sample lock (Profiler::_locks).
+    // May allocate; do not call in asynchronous signal handlers.
+    // TODO: revisit this if Profiler::_class_map lifecycle changes.
+    u32 classId() const;
 };
 
 class ExecutionEvent : public Event {
@@ -67,13 +80,13 @@ class WallClockEvent : public Event {
     u64 _trace_id_lo;
 };
 
-class AllocEvent : public EventWithClassId {
+class AllocEvent : public EventWithClass {
   public:
     u64 _total_size;
     u64 _instance_size;
 };
 
-class LockEvent : public EventWithClassId {
+class LockEvent : public EventWithClass {
   public:
     u64 _end_time;
     uintptr_t _address;
@@ -86,7 +99,7 @@ class NativeLockEvent : public Event {
     uintptr_t _address;
 };
 
-class LiveObject : public EventWithClassId {
+class LiveObject : public EventWithClass {
   public:
     u64 _alloc_size;
     u64 _alloc_time;

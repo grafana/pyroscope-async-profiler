@@ -23,6 +23,7 @@
 #include "os.h"
 #include "processSampler.h"
 #include "profiler.h"
+#include "rateLimit.h"
 #include "spinLock.h"
 #include "symbols.h"
 #include "threadFilter.h"
@@ -50,6 +51,17 @@ const u64 MIN_JLONG = 0x8000000000000000ULL;
 enum GCWhen {
     BEFORE_GC,
     AFTER_GC
+};
+
+static constexpr unsigned char JFR_TYPE_FOR_CATEGORY[EC_CATEGORIES] = {
+    T_EXECUTION_SAMPLE,   // EC_CPU
+    T_ALLOC_IN_NEW_TLAB,  // EC_ALLOC
+    T_MONITOR_ENTER,      // EC_LOCK
+    T_WALL_CLOCK_SAMPLE,  // EC_WALL
+    T_MALLOC,             // EC_NATIVEMEM
+    T_NATIVE_LOCK,        // EC_NATIVELOCK
+    T_METHOD_TRACE,       // EC_TRACE
+    T_SPAN,               // EC_SPAN
 };
 
 
@@ -234,7 +246,7 @@ class Recording {
     int _memfd;
     char* _master_recording_file;
     off_t _chunk_start;
-    ThreadFilter _thread_set;
+    ThreadBitSet _thread_set;
     MethodMap _method_map;
     Dictionary _string_pool;
 
@@ -637,7 +649,8 @@ class Recording {
         writeStringSetting(buf, T_ACTIVE_RECORDING, "cstack", SETTING_CSTACK[args._cstack]);
         writeStringSetting(buf, T_ACTIVE_RECORDING, "clock", TSC::enabled() ? "tsc" : "monotonic");
         writeStringSetting(buf, T_ACTIVE_RECORDING, "event", args._event);
-        writeStringSetting(buf, T_ACTIVE_RECORDING, "filter", args._filter);
+        writeListSetting(buf, T_ACTIVE_RECORDING, "ithread", args._threads_include);
+        writeListSetting(buf, T_ACTIVE_RECORDING, "xthread", args._threads_exclude);
         writeStringSetting(buf, T_ACTIVE_RECORDING, "begin", args._begin);
         writeStringSetting(buf, T_ACTIVE_RECORDING, "end", args._end);
         writeListSetting(buf, T_ACTIVE_RECORDING, "include", args._include);
@@ -647,6 +660,12 @@ class Recording {
         writeIntSetting(buf, T_ACTIVE_RECORDING, "chunksize", args._chunk_size);
         writeIntSetting(buf, T_ACTIVE_RECORDING, "chunktime", args._chunk_time);
         writeIntSetting(buf, T_ACTIVE_RECORDING, "memlimit", args._mem_limit);
+
+        for (int i = 0; i < EC_CATEGORIES; i++) {
+            if (args._rate_limit[i] >= 0) {
+                writeIntSetting(buf, JFR_TYPE_FOR_CATEGORY[i], "ratelimit", args._rate_limit[i]);
+            }
+        }
 
         char str[256];
         writeStringSetting(buf, T_ACTIVE_RECORDING, "features", getFeaturesString(str, sizeof(str), args._features));
@@ -1105,12 +1124,13 @@ class Recording {
     }
 
     void recordAllocationInNewTLAB(Buffer* buf, int tid, u32 call_trace_id, AllocEvent* event) {
+        u32 class_id = event->classId();
         int start = buf->skip(1);
         buf->put8(T_ALLOC_IN_NEW_TLAB);
         buf->putVar64(event->_start_time);
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
-        buf->putVar32(event->_class_id);
+        buf->putVar32(class_id);
         buf->putVar64(event->_instance_size);
         buf->putVar64(event->_total_size);
         writePyroscopeContext(buf);
@@ -1119,12 +1139,13 @@ class Recording {
 
 
     void recordAllocationOutsideTLAB(Buffer* buf, int tid, u32 call_trace_id, AllocEvent* event) {
+        u32 class_id = event->classId();
         int start = buf->skip(1);
         buf->put8(T_ALLOC_OUTSIDE_TLAB);
         buf->putVar64(event->_start_time);
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
-        buf->putVar32(event->_class_id);
+        buf->putVar32(class_id);
         buf->putVar64(event->_total_size);
         writePyroscopeContext(buf);
         buf->put8(start, buf->offset() - start);
@@ -1197,25 +1218,27 @@ class Recording {
     }
 
     void recordLiveObject(Buffer* buf, int tid, u32 call_trace_id, LiveObject* event) {
+        u32 class_id = event->classId();
         int start = buf->skip(1);
         buf->put8(T_LIVE_OBJECT);
         buf->putVar64(event->_start_time);
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
-        buf->putVar32(event->_class_id);
+        buf->putVar32(class_id);
         buf->putVar64(event->_alloc_size);
         buf->putVar64(event->_alloc_time);
         buf->put8(start, buf->offset() - start);
     }
 
     void recordMonitorBlocked(Buffer* buf, int tid, u32 call_trace_id, LockEvent* event) {
+        u32 class_id = event->classId();
         int start = buf->skip(1);
         buf->put8(T_MONITOR_ENTER);
         buf->putVar64(event->_start_time);
         buf->putVar64(event->_end_time - event->_start_time);
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
-        buf->putVar32(event->_class_id);
+        buf->putVar32(class_id);
         buf->put8(0);
         buf->putVar64(event->_address);
         writePyroscopeContext(buf);
@@ -1223,13 +1246,14 @@ class Recording {
     }
 
     void recordThreadPark(Buffer* buf, int tid, u32 call_trace_id, LockEvent* event) {
+        u32 class_id = event->classId();
         int start = buf->skip(1);
         buf->put8(T_THREAD_PARK);
         buf->putVar64(event->_start_time);
         buf->putVar64(event->_end_time - event->_start_time);
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
-        buf->putVar32(event->_class_id);
+        buf->putVar32(class_id);
         buf->putVar64(event->_timeout);
         buf->putVar64(MIN_JLONG);
         buf->putVar64(event->_address);
@@ -1296,7 +1320,7 @@ class Recording {
     }
 
     void addThread(int tid) {
-        if (!_thread_set.accept(tid)) {
+        if (!_thread_set.contains(tid)) {
             _thread_set.add(tid);
         }
     }
@@ -1312,6 +1336,9 @@ Error FlightRecorder::start(Arguments& args, bool reset) {
     const char* filename = args.file();
     if (filename == NULL || filename[0] == 0) {
         return Error("Flight Recorder output file is not specified");
+    }
+    if (Arguments::isUrl(filename)) {
+        return Error("Flight Recorder requires a local file");
     }
 
     char* filename_tmp = NULL;
@@ -1341,6 +1368,7 @@ Error FlightRecorder::start(Arguments& args, bool reset) {
         free(filename_tmp);
     }
 
+    RateLimit::enable(args);
     RecordingAPI::start();
 
     _rec = new Recording(fd, master_recording_file, args);
@@ -1353,6 +1381,7 @@ void FlightRecorder::stop() {
         _rec_lock.lock();
 
         RecordingAPI::stop();
+        RateLimit::disable();
 
         if (_rec->hasMasterRecording()) {
             stopMasterRecording();
@@ -1386,6 +1415,8 @@ bool FlightRecorder::timerTick(u64 wall_time, u32 gc_id) {
         // No active recording
         return false;
     }
+
+    RateLimit::refill();
 
     _rec->cpuMonitorCycle();
     _rec->heapMonitorCycle(gc_id);
@@ -1444,8 +1475,7 @@ Error FlightRecorder::startMasterRecording(Arguments& args, const char* filename
     jobject jfilename = env->NewStringUTF(filename);
     jobject jsettings = args._jfr_sync == NULL ? NULL : env->NewStringUTF(args._jfr_sync);
 
-    int event_mask = args.eventMask() |
-                     ((args._jfr_options ^ JFR_SYNC_OPTS) << EVENT_MASK_SIZE);
+    int event_mask = args.eventMask() | (args._jfr_options ^ JFR_SYNC_OPTS) << EC_CATEGORIES;
 
     storeRelease(_jfr_starting, true);
     env->CallStaticVoidMethod(_jfr_sync_class, _start_method, jfilename, jsettings, event_mask);
@@ -1521,6 +1551,8 @@ void FlightRecorder::recordEvent(int lock_index, int tid, u32 call_trace_id,
             case USER_EVENT:
                 _rec->recordUserEvent(buf, tid, (UserEvent*)event);
                 break;
+            default:
+                assert(false);  // should not reach here
         }
         _rec->flushIfNeeded(buf);
         _rec->addThread(tid);

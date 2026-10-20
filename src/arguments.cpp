@@ -128,6 +128,11 @@ Error Arguments::parse(const char* args) {
             CASE("total")
                 _counter = COUNTER_TOTAL;
 
+            CASE("ratelimit")
+                if (value == NULL || !parseRateLimit(value)) {
+                    msg = "Invalid ratelimit";
+                }
+
             CASE("chunksize")
                 if (value == NULL || (_chunk_size = parseUnits(value, BYTES)) < 0) {
                     msg = "Invalid chunksize";
@@ -280,12 +285,6 @@ Error Arguments::parse(const char* args) {
             CASE("quiet")
                 _quiet = true;
 
-            CASE("server")
-                if (value == NULL || value[0] == 0) {
-                    msg = "server address must not be empty";
-                }
-                _server = value;
-
             CASE("fdtransfer")
                 _fdtransfer = true;
                 if (value == NULL || value[0] == 0) {
@@ -295,7 +294,26 @@ Error Arguments::parse(const char* args) {
 
             // Filters
             CASE("filter")
-                _filter = value == NULL ? "" : value;
+                _filter_enabled = true;
+                if (value != NULL && value[0] != 0) {
+                    msg = "filter does not take a value; use ithread/xthread";
+                }
+
+            CASE("ithread")
+                _filter_enabled = true;
+                if (value == NULL) {
+                    msg = "ithread requires a thread name pattern";
+                } else {
+                    _threads_include.push_back(value);
+                }
+
+            CASE("xthread")
+                _filter_enabled = true;
+                if (value == NULL) {
+                    msg = "xthread requires a thread name pattern";
+                } else {
+                    _threads_exclude.push_back(value);
+                }
 
             CASE("include")
                 _include.push_back(value);
@@ -419,9 +437,6 @@ Error Arguments::parse(const char* args) {
 
     if (_file != NULL && _output == OUTPUT_NONE) {
         _output = detectOutputFormat(_file);
-        if (_output == OUTPUT_SVG) {
-            return Error("SVG format is obsolete, use .html for FlameGraph");
-        }
         _dump_traces = 100;
         _dump_flat = 200;
     }
@@ -502,6 +517,8 @@ const char* Arguments::expandFilePattern(const char* pattern) {
                         continue;
                     }
                 }
+            } else if (c != '%') {
+                *ptr++ = '%';  // keep other escape sequences (e.g. URL encoding) intact
             }
         }
         *ptr++ = c;
@@ -512,6 +529,10 @@ const char* Arguments::expandFilePattern(const char* pattern) {
 }
 
 Output Arguments::detectOutputFormat(const char* file) {
+    if (isUrl(file)) {
+        return OUTPUT_OTLP;
+    }
+
     const char* ext = strrchr(file, '.');
     if (ext != NULL) {
         if (strcmp(ext, ".html") == 0) {
@@ -520,11 +541,13 @@ Output Arguments::detectOutputFormat(const char* file) {
             return OUTPUT_JFR;
         } else if (strcmp(ext, ".collapsed") == 0 || strcmp(ext, ".folded") == 0) {
             return OUTPUT_COLLAPSED;
-        } else if (strcmp(ext, ".svg") == 0) {
-            return OUTPUT_SVG;
         }
     }
     return OUTPUT_TEXT;
+}
+
+bool Arguments::isUrl(const char* file) {
+    return strncmp(file, "http://", 7) == 0 || strncmp(file, "https://", 8) == 0;
 }
 
 long Arguments::parseUnits(const char* str, const Multiplier* multipliers) {
@@ -561,6 +584,33 @@ int Arguments::parseTimeout(const char* str) {
     int mm = p[1] >= '0' && p[1] <= '5' ? atoi(p + 1) : 0xff;
     int ss = (p = strchr(p + 1, ':')) != NULL && p[1] >= '0' && p[1] <= '5' ? atoi(p + 1) : 0xff;
     return 0xff000000 | hh << 16 | mm << 8 | ss;
+}
+
+bool Arguments::parseRateLimit(char* str) {
+    static constexpr char CATEGORY_NAMES[] = "0:cpu,1:alloc,2:lock,3:wall,4:nativemem,5:nativelock,6:trace,7:span";
+
+    while (*str != 0) {
+        char* value = strchr(str, ':');
+        if (value == NULL) {
+            return false;
+        }
+        *value++ = 0;
+
+        const char* c = strstr(CATEGORY_NAMES + 2, str);
+        if (c == NULL || c[-1] != ':' || c[strlen(str)] > ',') {
+            return false;
+        }
+        int category = c[-2] - '0';
+
+        long limit = strtol(value, &str, 10);
+        if (limit < 0 || limit > INT_MAX || str == value || *str > ';') {
+            return false;
+        }
+        if (*str) str++;
+
+        _rate_limit[category] = limit;
+    }
+    return true;
 }
 
 Arguments::~Arguments() {

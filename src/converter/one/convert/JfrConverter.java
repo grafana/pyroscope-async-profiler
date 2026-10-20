@@ -61,9 +61,10 @@ public abstract class JfrConverter extends Classifier {
         jfr.stopAtNewChunk = true;
         while (jfr.hasMoreChunks()) {
             long minLatencyTicks = (long) (args.latency * (jfr.ticksPerSec / 1e9));
-            String requiredTag = args.tag;
+            Pattern requiredTag = args.tag;
             for (IntervalEvent event; (event = jfr.readEvent(IntervalEvent.class)) != null; found = true) {
-                if (event.duration >= minLatencyTicks && (requiredTag == null || requiredTag.equals(event.tag()))) {
+                if (event.duration >= minLatencyTicks && (requiredTag == null
+                        || event.tag() != null && requiredTag.matcher(event.tag()).matches())) {
                     TreeMap<Long, Integer> threadDeltas = deltas.computeIfAbsent(event.tid, k -> new TreeMap<>());
                     threadDeltas.merge(jfr.eventTimeToNanos(event.time), 1, Integer::sum);
                     threadDeltas.merge(jfr.eventTimeToNanos(event.time + event.duration), -1, Integer::sum);
@@ -155,14 +156,16 @@ public abstract class JfrConverter extends Classifier {
         }
 
         StackTrace stackTrace = jfr.stackTraces.get(stackId);
-        for (int i = 0; i < stackTrace.methods.length; i++) {
-            String name = getMethodName(stackTrace.methods[i], stackTrace.types[i]);
-            if (exclude != null && exclude.matcher(name).matches()) {
-                return true;
-            }
-            if (include != null && include.matcher(name).matches()) {
-                if (exclude == null) return false;
-                include = null;
+        if (stackTrace != null) {
+            for (int i = 0; i < stackTrace.methods.length; i++) {
+                String name = getMethodName(stackTrace.methods[i], stackTrace.types[i]);
+                if (exclude != null && exclude.matcher(name).matches()) {
+                    return true;
+                }
+                if (include != null && include.matcher(name).matches()) {
+                    if (exclude == null) return false;
+                    include = null;
+                }
             }
         }
         return include != null;
@@ -355,11 +358,11 @@ public abstract class JfrConverter extends Classifier {
     }
 
     public double counterFactor() {
-        return (args.lock || args.nativelock) ? jfr.nanosPerTick : 1.0;
+        return (args.lock || args.nativelock || args.trace) ? jfr.nanosPerTick : 1.0;
     }
 
     // Select sum(samples) or sum(value) depending on the --total option.
-    // For lock and nativelock events, convert lock duration from ticks to nanoseconds.
+    // For lock, nativelock and trace events, convert duration from ticks to nanoseconds.
     protected abstract class AggregatedEventVisitor implements EventCollector.Visitor {
         private final double factor = !args.total ? 0.0 : counterFactor();
 

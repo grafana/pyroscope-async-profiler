@@ -161,7 +161,7 @@ public class Main {
                 "     --from TIME        Start time in ms (absolute or relative)\n" +
                 "     --to TIME          End time in ms (absolute or relative)\n" +
                 "     --latency MS       Retain only samples within same-thread spans of at least MS milliseconds\n" +
-                "     --tag STRING       Retain only samples within same-thread spans labeled with the given tag\n" +
+                "     --tag REGEX        Retain only samples within same-thread spans whose tag matches REGEX\n" +
                 "\n" +
                 "Flame Graph options:\n" +
                 "     --title STRING     Flame Graph title\n" +
@@ -171,6 +171,7 @@ public class Main {
                 "  -r --reverse          Reverse stack traces (defaults to icicle graph)\n" +
                 "  -i --inverted         Toggles the layout for reversed stacktraces from icicle to flamegraph\n" +
                 "                        and for default stacktraces from flamegraph to icicle\n" +
+                "     --tree             Render call tree\n" +
                 "     --highlight REGEX  Highlight frames matching the given pattern\n");
     }
 }

@@ -98,7 +98,10 @@ class Profiler {
     // dlopen() hook support
     void** _dlopen_entry;
     static void* dlopen_hook(const char* filename, int flags);
-    void switchLibraryTrap(bool enable);
+    // pthread_setspecific() hook support
+    void** _pthread_setspecific_entry;
+    static int pthread_setspecific_hook(pthread_key_t key, const void* value);
+    void switchLibcHooks(bool enable);
 
     Error installTraps(const char* begin, const char* end, bool nostop);
     void uninstallTraps();
@@ -111,7 +114,8 @@ class Profiler {
     void onGarbageCollectionFinish();
 
     const char* asgctError(int code);
-    u32 getLockIndex(int tid);
+    int tryLock(int tid);
+    void unlock(int lock_index);
     int getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, EventType event_type, int tid, u64* cpu);
     int getJavaTraceAsync(void* ucontext, ASGCT_CallFrame* frames, int max_depth);
     int getJavaTraceJvmti(jvmtiFrameInfo* jvmti_frames, ASGCT_CallFrame* frames, int start_depth, int max_depth);
@@ -132,6 +136,10 @@ class Profiler {
 
     void logEmptyOutput(Arguments& args, u64 printed_samples_count, Writer& out);
 
+    bool hasEvent(EventCategory category) const {
+        return (_event_mask & (1 << category)) != 0;
+    }
+
     static void jvmtiTimerEntry(jvmtiEnv* jvmti, JNIEnv* jni, void* arg) {
         instance()->timerLoop(arg);
     }
@@ -145,7 +153,7 @@ class Profiler {
     void unlockAll();
 
     void dumpCollapsed(Writer& out, Arguments& args);
-    void dumpFlameGraph(Writer& out, Arguments& args, bool tree);
+    void dumpFlameGraph(Writer& out, Arguments& args);
     void dumpText(Writer& out, Arguments& args);
     void dumpOtlp(Writer& out, Arguments& args);
 
@@ -169,7 +177,8 @@ class Profiler {
         _stubs_lock(),
         _runtime_stubs("[stubs]"),
         _native_libs(),
-        _dlopen_entry(NULL) {
+        _dlopen_entry(NULL),
+        _pthread_setspecific_entry(NULL) {
 
         for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
             _calltrace_buffer[i] = NULL;

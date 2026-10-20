@@ -29,6 +29,7 @@ public class FlameGraph implements Comparator<Frame> {
     private final StringBuilder outbuf = new StringBuilder(FLUSH_THRESHOLD + 1000);
 
     private String title = "Flame Graph";
+    private String units;
     private int[] order;
     private int[] cpoolMap;
     private int depth;
@@ -74,12 +75,14 @@ public class FlameGraph implements Comparator<Frame> {
         Frame[] levels = new Frame[128];
         int level = 0;
         long total = 0;
-        boolean needRebuild = args.reverse || args.include != null || args.exclude != null;
+        boolean needRebuild = args.reverse || args.skip > 0 || args.include != null || args.exclude != null;
 
         try (BufferedReader br = new BufferedReader(in)) {
             for (String line; !(line = br.readLine()).startsWith("const cpool"); ) {
                 if (line.startsWith("<h1")) {
                     title = line.substring(line.indexOf('>') + 1, line.lastIndexOf("</h1>"));
+                } else if (line.startsWith("\tconst units =")) {
+                    units = line.substring(line.indexOf('\'') + 1, line.lastIndexOf('\''));
                 }
             }
             br.readLine();
@@ -229,6 +232,12 @@ public class FlameGraph implements Comparator<Frame> {
         tail = printTill(out, tail, "/*inverted:*/false");
         out.print(args.reverse ^ args.inverted);
 
+        tail = printTill(out, tail, "/*treeview:*/false");
+        out.print(args.tree);
+
+        tail = printTill(out, tail, "/*units:*/");
+        out.print(units != null ? units : getValueUnits());
+
         tail = printTill(out, tail, "/*maxdiff:*/-1");
         out.print(maxdiff);
 
@@ -346,6 +355,14 @@ public class FlameGraph implements Comparator<Frame> {
         }
 
         sb.setLength(prevLength);
+    }
+
+    private String getValueUnits() {
+        if (args.total) {
+            if (args.nativemem || args.alloc || args.live) return "bytes";
+            if (args.lock || args.nativelock || args.trace) return "ns";
+        }
+        return "samples";
     }
 
     private boolean excludeStack(CallStack stack) {
