@@ -4,87 +4,39 @@
  */
 
 #include <errno.h>
-#include <pthread.h>
 #include "cpuEngine.h"
 #include "j9StackTraces.h"
 #include "profiler.h"
 #include "stackWalker.h"
 #include "tsc.h"
-#include "vmStructs.h"
 
 
-void** CpuEngine::_pthread_entry = NULL;
-CpuEngine* CpuEngine::_current = NULL;
+CpuEngine* CpuEngine::_current = nullptr;
 
 long CpuEngine::_interval;
 CStack CpuEngine::_cstack;
 int CpuEngine::_signal;
 bool CpuEngine::_count_overrun;
 
-// Intercept thread creation/termination by patching libjvm's GOT entry for pthread_setspecific().
-// HotSpot puts VMThread into TLS on thread start, and resets on thread end.
-static int pthread_setspecific_hook(pthread_key_t key, const void* value) {
-    if (key != VMThread::key()) {
-        return pthread_setspecific(key, value);
-    }
-    if (pthread_getspecific(key) == value) {
-        return 0;
-    }
-
-    if (value != NULL) {
-        int result = pthread_setspecific(key, value);
-        CpuEngine::onThreadStart();
-        return result;
-    } else {
-        CpuEngine::onThreadEnd();
-        return pthread_setspecific(key, value);
-    }
-}
-
 void CpuEngine::onThreadStart() {
     CpuEngine* current = loadAcquire(_current);
-    if (current != NULL) {
+    if (current != nullptr) {
         current->createForThread(OS::threadId());
     }
 }
 
 void CpuEngine::onThreadEnd() {
     CpuEngine* current = loadAcquire(_current);
-    if (current != NULL) {
+    if (current != nullptr) {
         current->destroyForThread(OS::threadId());
     }
 }
 
-bool CpuEngine::setupThreadHook() {
-    if (_pthread_entry != NULL) {
-        return true;
-    }
-
-    if (!VM::loaded()) {
-        static void* dummy_pthread_entry;
-        _pthread_entry = &dummy_pthread_entry;
-        return true;
-    }
-
-    // Depending on Zing version, pthread_setspecific is called either from libazsys.so or from libjvm.so
-    if (VM::isZing()) {
-        CodeCache* libazsys = Profiler::instance()->findLibraryByName("libazsys");
-        if (libazsys != NULL && (_pthread_entry = libazsys->findImport(im_pthread_setspecific)) != NULL) {
-            return true;
-        }
-    }
-
-    CodeCache* lib = Profiler::instance()->findJvmLibrary("libj9thr");
-    return lib != NULL && (_pthread_entry = lib->findImport(im_pthread_setspecific)) != NULL;
-}
-
-void CpuEngine::enableThreadHook() {
-    *_pthread_entry = (void*)pthread_setspecific_hook;
+void CpuEngine::enableThreadEvents() {
     storeRelease(_current, this);
 }
 
-void CpuEngine::disableThreadHook() {
-    *_pthread_entry = (void*)pthread_setspecific;
+void CpuEngine::disableThreadEvents() {
     storeRelease(_current, nullptr);
 }
 

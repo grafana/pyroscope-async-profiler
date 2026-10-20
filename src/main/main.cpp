@@ -45,7 +45,7 @@ static const char USAGE_STRING[] =
     "Options:\n"
     "  -e event            profiling event: cpu|alloc|nativemem|lock|cache-misses etc.\n"
     "  -d duration         run profiling for <duration> seconds\n"
-    "  -f filename         dump output to <filename>\n"
+    "  -f filename         file name or http(s) URL to submit profiles to\n"
     "  -i interval         sampling interval in nanoseconds\n"
     "  -j jstackdepth      maximum Java stack depth\n"
     "  -t, --threads       profile different threads separately\n"
@@ -79,6 +79,8 @@ static const char USAGE_STRING[] =
     "  --nativelock time   pthread mutex/rwlock profiling threshold in nanoseconds\n"
     "  --wall interval     wall clock profiling interval\n"
     "  --nobatch           legacy wall clock sampling without batch events\n"
+    "  --ithread pattern   in wall clock mode, profile only threads matching the name pattern\n"
+    "  --xthread pattern   in wall clock mode, skip threads matching the name pattern\n"
     "  --proc interval     process sampling interval (default: 30s)\n"
     "  --all               shorthand for enabling cpu, wall, alloc, live,\n"
     "                      nativemem and lock profiling simultaneously\n"
@@ -93,6 +95,7 @@ static const char USAGE_STRING[] =
     "  --ttsp              only time-to-safepoint profiling \n"
     "  --nostop            do not stop profiling outside --begin/--end window\n"
     "  --memlimit bytes    limit size of the stack trace storage\n"
+    "  --ratelimit limits  limit the number of JFR events emitted per second\n"
     "  --jfropts opts      JFR recording options: mem\n"
     "  --jfrsync config    synchronize profiler with JFR recording\n"
     "  --libpath path      full path to libasyncProfiler.so in the container\n"
@@ -244,7 +247,7 @@ static void setup_output_files(int pid) {
     if (file == "") {
         file = String("/tmp/asprof.") << self_pid << "." << pid;
         use_tmp_file = true;
-    } else if (file.str()[0] != '/' && getcwd(current_dir, sizeof(current_dir)) != NULL) {
+    } else if (file.str()[0] != '/' && strstr(file.str(), "://") == NULL && getcwd(current_dir, sizeof(current_dir)) != NULL) {
         file = String(current_dir) << "/" << file;
     }
 
@@ -492,9 +495,6 @@ int main(int argc, const char** argv) {
         } else if (arg == "-F" || arg == "--features") {
             format << ",features=" << String(args.next()).replace(',', "+");
 
-        } else if (arg == "--filter") {
-            format << ",filter=" << String(args.next()).replace(',', ";");
-
         } else if (arg == "--title") {
             format << ",title=" << String(args.next()).replace('&', "&amp;")
                                                       .replace('<', "&lt;")
@@ -510,7 +510,8 @@ int main(int argc, const char** argv) {
         } else if (arg == "--alloc" || arg == "--nativemem" || arg == "--nativelock" || arg == "--lock" ||
                    arg == "--wall" || arg == "--trace" || arg == "--chunksize" || arg == "--chunktime" ||
                    arg == "--cstack" || arg == "--signal" || arg == "--clock" || arg == "--begin" || arg == "--end" ||
-                   arg == "--target-cpu" || arg == "--proc" || arg == "--memlimit") {
+                   arg == "--target-cpu" || arg == "--proc" || arg == "--memlimit" ||
+                   arg == "--ithread" || arg == "--xthread") {
             params << "," << (arg.str() + 2) << "=" << args.next();
 
         } else if (arg == "--all" || arg == "--live" || arg == "--nobatch" || arg == "--nofree" || arg == "--nostop" ||
@@ -519,6 +520,9 @@ int main(int argc, const char** argv) {
 
         } else if (arg == "--all-user") {
             params << ",alluser";
+
+        } else if (arg == "--ratelimit") {
+            params << ",ratelimit=" << String(args.next()).replace(',', ";");
 
         } else if (arg == "--jfrsync" || arg == "--jfropts") {
             params << "," << (arg.str() + 2) << "=" << args.next();

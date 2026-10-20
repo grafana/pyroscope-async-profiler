@@ -13,7 +13,6 @@
 // Base class for CPU sampling engines: PerfEvents, CTimer, ITimer
 class CpuEngine : public Engine {
   protected:
-    static void** _pthread_entry;
     static CpuEngine* _current;
 
     static long _interval;
@@ -24,10 +23,8 @@ class CpuEngine : public Engine {
     static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext);
     static void signalHandlerJ9(int signo, siginfo_t* siginfo, void* ucontext);
 
-    static bool setupThreadHook();
-
-    void enableThreadHook();
-    void disableThreadHook();
+    void enableThreadEvents();
+    void disableThreadEvents();
 
     bool isResourceLimit(int err);
 

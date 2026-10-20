@@ -33,8 +33,10 @@
 #include "flightRecorder.h"
 #include "fdtransferClient.h"
 #include "frameName.h"
+#include "httpClient.h"
 #include "os.h"
 #include "otlp.h"
+#include "rateLimit.h"
 #include "safeAccess.h"
 #include "stackFrame.h"
 #include "stackWalker.h"
@@ -146,16 +148,10 @@ void Profiler::addRuntimeStub(const void* address, int length, const char* name)
 }
 
 void Profiler::onThreadStart(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
-    if (_thread_filter.enabled()) {
-        _thread_filter.remove(OS::threadId());
-    }
     updateThreadName(jvmti, jni, thread);
 }
 
 void Profiler::onThreadEnd(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
-    if (_thread_filter.enabled()) {
-        _thread_filter.remove(OS::threadId());
-    }
     updateThreadName(jvmti, jni, thread);
 }
 
@@ -196,11 +192,20 @@ const char* Profiler::asgctError(int code) {
     }
 }
 
-inline u32 Profiler::getLockIndex(int tid) {
+inline int Profiler::tryLock(int tid) {
     u32 lock_index = tid;
     lock_index ^= lock_index >> 8;
     lock_index ^= lock_index >> 4;
-    return lock_index % CONCURRENCY_LEVEL;
+    if (_locks[lock_index %= CONCURRENCY_LEVEL].tryLock() ||
+        _locks[lock_index = (lock_index + 1) % CONCURRENCY_LEVEL].tryLock() ||
+        _locks[lock_index = (lock_index + 2) % CONCURRENCY_LEVEL].tryLock()) {
+        return lock_index;
+    }
+    return -1;
+}
+
+inline void Profiler::unlock(int lock_index) {
+    _locks[lock_index].unlock();
 }
 
 void Profiler::updateSymbols(bool kernel_symbols) {
@@ -408,12 +413,10 @@ u64 Profiler::recordSample(void* ucontext, u64 counter, EventType event_type, Ev
     atomicInc(_total_samples);
 
     int tid = OS::threadId();
-    u32 lock_index = getLockIndex(tid);
-    if (!_locks[lock_index].tryLock() &&
-        !_locks[lock_index = (lock_index + 1) % CONCURRENCY_LEVEL].tryLock() &&
-        !_locks[lock_index = (lock_index + 2) % CONCURRENCY_LEVEL].tryLock())
-    {
-        // Too many concurrent signals already
+    int lock_index;
+
+    if (!RateLimit::allow(event_type) || (lock_index = tryLock(tid)) < 0) {
+        // Too many events or too many concurrent signals
         atomicInc(_failures[-ticks_skipped]);
 
         if (event_type == PERF_SAMPLE) {
@@ -430,7 +433,7 @@ u64 Profiler::recordSample(void* ucontext, u64 counter, EventType event_type, Ev
 
     int num_frames = 0;
     if (_add_event_frame && event_type >= ALLOC_SAMPLE && event_type <= PARK_SAMPLE) {
-        u32 class_id = ((EventWithClassId*)event)->_class_id;
+        u32 class_id = ((EventWithClass*)event)->classId();
         if (class_id != 0) {
             // Convert event_type to frame_type, e.g. ALLOC_SAMPLE -> BCI_ALLOC
             jint frame_type = BCI_ALLOC - (event_type - ALLOC_SAMPLE);
@@ -495,12 +498,17 @@ u64 Profiler::recordSample(void* ucontext, u64 counter, EventType event_type, Ev
     u32 call_trace_id = _call_trace_storage.put(num_frames, frames, counter);
     _jfr.recordEvent(lock_index, tid, call_trace_id, event_type, event);
 
-    _locks[lock_index].unlock();
+    unlock(lock_index);
     return (u64)tid << 32 | call_trace_id;
 }
 
 void Profiler::recordExternalSample(u64 counter, int tid, EventType event_type, Event* event, int num_frames, ASGCT_CallFrame* frames) {
     atomicInc(_total_samples);
+
+    if (!RateLimit::allow(event_type)) {
+        atomicInc(_failures[-ticks_skipped]);
+        return;
+    }
 
     if (_add_thread_frame) {
         num_frames += makeFrame(frames + num_frames, BCI_THREAD_ID, tid);
@@ -511,11 +519,8 @@ void Profiler::recordExternalSample(u64 counter, int tid, EventType event_type, 
 
     u32 call_trace_id = _call_trace_storage.put(num_frames, frames, counter);
 
-    u32 lock_index = getLockIndex(tid);
-    if (!_locks[lock_index].tryLock() &&
-        !_locks[lock_index = (lock_index + 1) % CONCURRENCY_LEVEL].tryLock() &&
-        !_locks[lock_index = (lock_index + 2) % CONCURRENCY_LEVEL].tryLock())
-    {
+    int lock_index = tryLock(tid);
+    if (lock_index < 0) {
         // Too many concurrent signals already
         atomicInc(_failures[-ticks_skipped]);
         return;
@@ -523,42 +528,34 @@ void Profiler::recordExternalSample(u64 counter, int tid, EventType event_type, 
 
     _jfr.recordEvent(lock_index, tid, call_trace_id, event_type, event);
 
-    _locks[lock_index].unlock();
+    unlock(lock_index);
 }
 
 void Profiler::recordExternalSamples(u64 samples, u64 counter, int tid, u32 call_trace_id, EventType event_type, Event* event) {
-    _call_trace_storage.add(call_trace_id, samples, counter);
-
-    u32 lock_index = getLockIndex(tid);
-    if (!_locks[lock_index].tryLock() &&
-        !_locks[lock_index = (lock_index + 1) % CONCURRENCY_LEVEL].tryLock() &&
-        !_locks[lock_index = (lock_index + 2) % CONCURRENCY_LEVEL].tryLock())
-    {
+    if (!RateLimit::allow(event_type)) {
         return;
     }
 
-    _jfr.recordEvent(lock_index, tid, call_trace_id, event_type, event);
+    _call_trace_storage.add(call_trace_id, samples, counter);
 
-    _locks[lock_index].unlock();
+    int lock_index = tryLock(tid);
+    if (lock_index >= 0) {
+        _jfr.recordEvent(lock_index, tid, call_trace_id, event_type, event);
+        unlock(lock_index);
+    }
 }
 
 void Profiler::recordEventOnly(EventType event_type, Event* event) {
-    if (!_jfr.active()) {
+    if (!_jfr.active() || !RateLimit::allow(event_type)) {
         return;
     }
 
     int tid = OS::threadId();
-    u32 lock_index = getLockIndex(tid);
-    if (!_locks[lock_index].tryLock() &&
-        !_locks[lock_index = (lock_index + 1) % CONCURRENCY_LEVEL].tryLock() &&
-        !_locks[lock_index = (lock_index + 2) % CONCURRENCY_LEVEL].tryLock())
-    {
-        return;
+    int lock_index = tryLock(tid);
+    if (lock_index >= 0) {
+        _jfr.recordEvent(lock_index, tid, 0, event_type, event);
+        unlock(lock_index);
     }
-
-    _jfr.recordEvent(lock_index, tid, 0, event_type, event);
-
-    _locks[lock_index].unlock();
 }
 
 void Profiler::tryResetCounters() {
@@ -580,10 +577,43 @@ void* Profiler::dlopen_hook(const char* filename, int flags) {
     return result;
 }
 
-void Profiler::switchLibraryTrap(bool enable) {
+// Intercept thread creation/termination by patching libjvm's GOT entry for pthread_setspecific().
+// HotSpot puts VMThread into TLS on thread start, and resets on thread end.
+int Profiler::pthread_setspecific_hook(pthread_key_t key, const void* value) {
+    if (key != VMThread::key()) {
+        return pthread_setspecific(key, value);
+    }
+    if (pthread_getspecific(key) == value) {
+        return 0;
+    }
+
+    Profiler* profiler = instance();
+    if (profiler->_thread_filter.enabled()) {
+        profiler->_thread_filter.remove(OS::threadId());
+    }
+
+    if (value != NULL) {
+        int result = pthread_setspecific(key, value);
+        // Workaround for #1743: the second call repairs TLS if it was corrupted by the nested pthread_getspecific
+        pthread_setspecific(key, value);
+        CpuEngine::onThreadStart();
+        return result;
+    } else {
+        CpuEngine::onThreadEnd();
+        return pthread_setspecific(key, value);
+    }
+}
+
+
+void Profiler::switchLibcHooks(bool enable) {
     if (_dlopen_entry != NULL) {
         void* impl = enable ? (void*)dlopen_hook : (void*)dlopen;
         storeRelease(*_dlopen_entry, impl);
+    }
+
+    if (_pthread_setspecific_entry != NULL) {
+        void* impl = enable ? (void*)pthread_setspecific_hook : (void*)pthread_setspecific;
+        storeRelease(*_pthread_setspecific_entry, impl);
     }
 }
 
@@ -707,6 +737,7 @@ void Profiler::updateThreadName(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
         if (native_thread_id >= 0 && jvmti->GetThreadInfo(thread, &thread_info) == 0) {
             jlong java_thread_id = VMThread::javaThreadId(jni, thread);
             setThreadInfo(native_thread_id, thread_info.name, java_thread_id);
+            _thread_filter.update(native_thread_id, thread_info.name);
             jvmti->Deallocate((unsigned char*)thread_info.name);
         }
     }
@@ -715,18 +746,20 @@ void Profiler::updateThreadName(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
 void Profiler::updateJavaThreadNames() {
     if (_update_thread_names && VM::loaded()) {
         jvmtiEnv* jvmti = VM::jvmti();
+        JNIEnv* jni = VM::jni();
+        jni->PushLocalFrame(64);
+
         jint thread_count;
         jthread* thread_objects;
-        if (jvmti->GetAllThreads(&thread_count, &thread_objects) != 0) {
-            return;
+        if (jvmti->GetAllThreads(&thread_count, &thread_objects) == 0) {
+            for (int i = 0; i < thread_count; i++) {
+                updateThreadName(jvmti, jni, thread_objects[i]);
+            }
+
+            jvmti->Deallocate((unsigned char*)thread_objects);
         }
 
-        JNIEnv* jni = VM::jni();
-        for (int i = 0; i < thread_count; i++) {
-            updateThreadName(jvmti, jni, thread_objects[i]);
-        }
-
-        jvmti->Deallocate((unsigned char*)thread_objects);
+        jni->PopLocalFrame(NULL);
     }
 }
 
@@ -742,6 +775,7 @@ void Profiler::updateNativeThreadNames() {
             if (it == _thread_names.end() || it->first != tid) {
                 if (OS::threadName(tid, name_buf, sizeof(name_buf))) {
                     _thread_names.insert(it, std::map<int, std::string>::value_type(tid, name_buf));
+                    _thread_filter.update(tid, name_buf);
                 }
             }
         }
@@ -792,17 +826,17 @@ Engine* Profiler::selectAllocEngine(bool tlab) {
 
 Engine* Profiler::activeEngine() {
     switch (_event_mask) {
-        case EM_ALLOC:
+        case 1 << EC_ALLOC:
             return _alloc_engine;
-        case EM_LOCK:
+        case 1 << EC_LOCK:
             return &lock_tracer;
-        case EM_WALL:
+        case 1 << EC_WALL:
             return &wall_clock;
-        case EM_NATIVEMEM:
+        case 1 << EC_NATIVEMEM:
             return &malloc_tracer;
-        case EM_NATIVELOCK:
+        case 1 << EC_NATIVELOCK:
             return &native_lock_tracer;
-        case EM_METHOD_TRACE:
+        case 1 << EC_TRACE:
             return &instrument;
         default:
             return _engine;
@@ -823,6 +857,21 @@ Error Profiler::checkJvmCapabilities() {
             CodeCache* lib = findJvmLibrary("libj9prt");
             if (lib == NULL || (_dlopen_entry = lib->findImport(im_dlopen)) == NULL) {
                 return Error("Could not set dlopen hook. Unsupported JVM?");
+            }
+        }
+
+        if (_pthread_setspecific_entry == NULL) {
+            // Depending on Zing version, pthread_setspecific is called either from libazsys.so or from libjvm.so
+            if (VM::isZing()) {
+                CodeCache* libazsys = findLibraryByName("libazsys");
+                _pthread_setspecific_entry = libazsys ? libazsys->findImport(im_pthread_setspecific) : NULL;
+            }
+
+            if (_pthread_setspecific_entry == NULL) {
+                CodeCache* lib = findJvmLibrary("libj9thr");
+                if (lib == NULL || (_pthread_setspecific_entry = lib->findImport(im_pthread_setspecific)) == NULL) {
+                    return Error("Could not set pthread_setspecific hook. Unsupported JVM?");
+                }
             }
         }
 
@@ -856,7 +905,7 @@ Error Profiler::start(Arguments& args, bool reset) {
         return Error("No profiling events specified");
     } else if ((_event_mask & (_event_mask - 1)) && args._output != OUTPUT_JFR) {
         return Error("Only JFR output supports multiple events");
-    } else if (!VM::loaded() && (_event_mask & (EM_ALLOC | EM_LOCK | EM_METHOD_TRACE))) {
+    } else if (!VM::loaded() && (_event_mask & (1 << EC_ALLOC | 1 << EC_LOCK | 1 << EC_TRACE))) {
         return Error("Profiling event is not supported with non-Java processes");
     }
 
@@ -929,9 +978,6 @@ Error Profiler::start(Arguments& args, bool reset) {
         _features.comp_task = 0;
     }
 
-    _update_thread_names = args._threads || args._output == OUTPUT_JFR;
-    _thread_filter.init(args._filter);
-
     _engine = selectEngine(args);
     if (_engine == &wall_clock && args._wall >= 0) {
         return Error("Cannot start wall clock with the selected event");
@@ -964,6 +1010,16 @@ Error Profiler::start(Arguments& args, bool reset) {
         return Error("mixed feature is only allowed with VMStructs stack walking");
     }
 
+    bool filter_threads = args._filter_enabled && (_engine == &wall_clock || hasEvent(EC_WALL));
+    bool filter_by_name = filter_threads && !(args._threads_include.empty() && args._threads_exclude.empty());
+    _update_thread_names = args._threads || args._output == OUTPUT_JFR || filter_by_name;
+
+    _thread_filter.init(filter_threads, args._threads_include, args._threads_exclude);
+    if (filter_by_name) {
+        updateJavaThreadNames();
+        updateNativeThreadNames();
+    }
+
     // Kernel symbols are useful only for perf_events without --all-user
     updateSymbols(_engine == &perf_events && !args._alluser);
 
@@ -971,13 +1027,13 @@ Error Profiler::start(Arguments& args, bool reset) {
     if (error) {
         return error;
     }
-    switchLibraryTrap(true);
+    switchLibcHooks(true);
 
     if (args._output == OUTPUT_JFR) {
         error = _jfr.start(args, reset);
         if (error) {
             uninstallTraps();
-            switchLibraryTrap(false);
+            switchLibcHooks(false);
             return error;
         }
     }
@@ -987,38 +1043,38 @@ Error Profiler::start(Arguments& args, bool reset) {
         goto error1;
     }
 
-    if (_event_mask & EM_ALLOC) {
+    if (hasEvent(EC_ALLOC)) {
         _alloc_engine = selectAllocEngine(args._tlab);
         error = _alloc_engine->start(args);
         if (error) {
             goto error2;
         }
     }
-    if (_event_mask & EM_LOCK) {
+    if (hasEvent(EC_LOCK)) {
         error = lock_tracer.start(args);
         if (error) {
             goto error3;
         }
     }
-    if (_event_mask & EM_WALL) {
+    if (hasEvent(EC_WALL)) {
         error = wall_clock.start(args);
         if (error) {
             goto error4;
         }
     }
-    if (_event_mask & EM_NATIVEMEM) {
+    if (hasEvent(EC_NATIVEMEM)) {
         error = malloc_tracer.start(args);
         if (error) {
             goto error5;
         }
     }
-    if (_event_mask & EM_NATIVELOCK) {
+    if (hasEvent(EC_NATIVELOCK)) {
         error = native_lock_tracer.start(args);
         if (error) {
             goto error6;
         }
     }
-    if (_event_mask & EM_METHOD_TRACE) {
+    if (hasEvent(EC_TRACE)) {
         error = instrument.start(args);
         if (error) {
             goto error7;
@@ -1042,26 +1098,26 @@ Error Profiler::start(Arguments& args, bool reset) {
     return Error::OK;
 
 error7:
-    if (_event_mask & EM_NATIVELOCK) native_lock_tracer.stop();
+    if (hasEvent(EC_NATIVELOCK)) native_lock_tracer.stop();
 
 error6:
-    if (_event_mask & EM_NATIVEMEM) malloc_tracer.stop();
+    if (hasEvent(EC_NATIVEMEM)) malloc_tracer.stop();
 
 error5:
-    if (_event_mask & EM_WALL) wall_clock.stop();
+    if (hasEvent(EC_WALL)) wall_clock.stop();
 
 error4:
-    if (_event_mask & EM_LOCK) lock_tracer.stop();
+    if (hasEvent(EC_LOCK)) lock_tracer.stop();
 
 error3:
-    if (_event_mask & EM_ALLOC) _alloc_engine->stop();
+    if (hasEvent(EC_ALLOC)) _alloc_engine->stop();
 
 error2:
     _engine->stop();
 
 error1:
     uninstallTraps();
-    switchLibraryTrap(false);
+    switchLibcHooks(false);
 
     lockAll();
     _jfr.stop();
@@ -1131,16 +1187,16 @@ Error Profiler::stop(bool restart) {
 
     uninstallTraps();
 
-    if (_event_mask & EM_WALL) wall_clock.stop();
-    if (_event_mask & EM_LOCK) lock_tracer.stop();
-    if (_event_mask & EM_ALLOC) _alloc_engine->stop();
-    if (_event_mask & EM_NATIVEMEM) malloc_tracer.stop();
-    if (_event_mask & EM_NATIVELOCK) native_lock_tracer.stop();
-    if (_event_mask & EM_METHOD_TRACE) instrument.stop();
+    if (hasEvent(EC_WALL)) wall_clock.stop();
+    if (hasEvent(EC_LOCK)) lock_tracer.stop();
+    if (hasEvent(EC_ALLOC)) _alloc_engine->stop();
+    if (hasEvent(EC_NATIVEMEM)) malloc_tracer.stop();
+    if (hasEvent(EC_NATIVELOCK)) native_lock_tracer.stop();
+    if (hasEvent(EC_TRACE)) instrument.stop();
 
     _engine->stop();
 
-    switchLibraryTrap(false);
+    switchLibcHooks(false);
     switchThreadEvents(JVMTI_DISABLE);
     updateJavaThreadNames();
     updateNativeThreadNames();
@@ -1172,7 +1228,7 @@ Error Profiler::flushJfr() {
 
     updateJavaThreadNames();
     updateNativeThreadNames();
-    if (_event_mask & EM_WALL) wall_clock.flush();
+    if (hasEvent(EC_WALL)) wall_clock.flush();
 
     lockAll();
     _jfr.flush();
@@ -1192,7 +1248,7 @@ Error Profiler::dump(Writer& out, Arguments& args) {
     if (_state == RUNNING) {
         updateJavaThreadNames();
         updateNativeThreadNames();
-        if (_event_mask & EM_WALL) wall_clock.flush();
+        if (hasEvent(EC_WALL)) wall_clock.flush();
     }
 
     switch (args._output) {
@@ -1200,10 +1256,8 @@ Error Profiler::dump(Writer& out, Arguments& args) {
             dumpCollapsed(out, args);
             break;
         case OUTPUT_FLAMEGRAPH:
-            dumpFlameGraph(out, args, false);
-            break;
         case OUTPUT_TREE:
-            dumpFlameGraph(out, args, true);
+            dumpFlameGraph(out, args);
             break;
         case OUTPUT_TEXT:
             dumpText(out, args);
@@ -1301,10 +1355,11 @@ void Profiler::dumpCollapsed(Writer& out, Arguments& args) {
     logEmptyOutput(args, printed_sample_count, out);
 }
 
-void Profiler::dumpFlameGraph(Writer& out, Arguments& args, bool tree) {
+void Profiler::dumpFlameGraph(Writer& out, Arguments& args) {
+    Engine* active_engine = activeEngine();
+
     char title[64];
     if (args._title == NULL) {
-        Engine* active_engine = activeEngine();
         if (args._counter == COUNTER_SAMPLES) {
             strcpy(title, active_engine->title());
         } else {
@@ -1312,7 +1367,9 @@ void Profiler::dumpFlameGraph(Writer& out, Arguments& args, bool tree) {
         }
     }
 
-    FlameGraph flamegraph(args._title == NULL ? title : args._title, args._counter, args._minwidth, args._reverse, args._inverted);
+    FlameGraph flamegraph(args._title == NULL ? title : args._title,
+                          args._counter == COUNTER_SAMPLES ? "samples" : active_engine->units(),
+                          args._minwidth, args._reverse, args._inverted, args._output == OUTPUT_TREE);
     u64 printed_sample_count = 0;
 
     {
@@ -1364,7 +1421,7 @@ void Profiler::dumpFlameGraph(Writer& out, Arguments& args, bool tree) {
         }
     }
 
-    flamegraph.dump(out, tree);
+    flamegraph.dump(out);
     logEmptyOutput(args, printed_sample_count, out);
 }
 
@@ -1671,13 +1728,18 @@ Error Profiler::runInternal(Arguments& args, Writer& out) {
 }
 
 Error Profiler::run(Arguments& args) {
-    if (!args.hasOutputFile()) {
+    const char* file = args.hasOutputFile() ? args.file() : NULL;
+    if (file == NULL) {
         LogWriter out;
         return runInternal(args, out);
+    } else if (Arguments::isUrl(file)) {
+        BufferWriter out;
+        Error error = runInternal(args, out);
+        return error ? error : HttpClient::send(file, out.buf(), out.size(), args._output);
     } else {
         // Open output file under the lock to avoid races with background timer
         MutexLocker ml(_state_lock);
-        FileWriter out(args.file());
+        FileWriter out(file);
         if (!out.is_open()) {
             return Error("Could not open output file");
         }
@@ -1686,28 +1748,45 @@ Error Profiler::run(Arguments& args) {
 }
 
 Error Profiler::expire(Arguments& args, bool restart) {
-    MutexLocker ml(_state_lock);
+    BufferWriter http_out;
+    const char* file = NULL;
 
-    Error error = stop(restart);
-    if (error) {
-        return error;
-    }
+    {
+        MutexLocker ml(_state_lock);
 
-    if (args._file != NULL && args._output != OUTPUT_NONE && args._output != OUTPUT_JFR) {
-        FileWriter out(args.file());
-        if (!out.is_open()) {
-            return Error("Could not open output file");
-        }
-        error = dump(out, args);
+        Error error = stop(restart);
         if (error) {
             return error;
         }
+
+        if (args._output != OUTPUT_NONE && args._output != OUTPUT_JFR && (file = args.file()) != NULL) {
+            if (Arguments::isUrl(file)) {
+                error = dump(http_out, args);
+            } else {
+                FileWriter out(file);
+                if (!out.is_open()) {
+                    return Error("Could not open output file");
+                }
+                error = dump(out, args);
+            }
+            if (error) {
+                return error;
+            }
+        }
+
+        if (restart) {
+            args._fdtransfer = false;  // keep the previous connection
+            args._file_num++;
+            error = start(args, true);
+            if (error) {
+                Log::info("%s", error.message());
+            }
+        }
     }
 
-    if (restart) {
-        args._fdtransfer = false;  // keep the previous connection
-        args._file_num++;
-        return start(args, true);
+    if (http_out.size() > 0) {
+        // Send profiles outside stop-start transaction to minimize the gap between interations
+        return HttpClient::send(file, http_out.buf(), http_out.size(), args._output);
     }
 
     return Error::OK;

@@ -84,7 +84,8 @@ public class JfrTests {
      * @param p The test process to profile with.
      * @throws Exception Any exception thrown during profiling JFR output parsing.
      */
-    @Test(mainClass = JfrMultiModeProfiling.class, agentArgs = "start,event=cpu,alloc,lock=0,quiet,jfr,file=%f", output = true)
+    @Test(mainClass = JfrMultiModeProfiling.class, agentArgs = "start,event=cpu,alloc,lock=0,quiet,jfr,file=%f", output = true, jvmVer = {9, Integer.MAX_VALUE})
+    @Test(mainClass = JfrMultiModeProfiling.class, agentArgs = "start,event=cpu,alloc,lock=0,quiet,jfr,file=%f", output = true, jvmVer = 8, jvmArgs = "-XX:+UseG1GC -XX:+UseCountedLoopSafepoints")
     public void parseMultiModeRecording(TestProcess p) throws Exception {
         Output output = p.waitForExit(TestProcess.STDOUT);
         assert p.exitCode() == 0;
@@ -204,6 +205,34 @@ public class JfrTests {
         assert events.contains("jdk.NativeLibrary");
     }
 
+    @Test(mainClass = ExceptionThrow.class, nameSuffix = "default",
+            agentArgs = "start,event=cpu,jfrsync=+jdk.JavaExceptionThrow,file=%f.jfr")
+    @Test(mainClass = ExceptionThrow.class, nameSuffix = "withStackTrace",
+            agentArgs = "start,event=cpu,jfrsync=+jdk.JavaExceptionThrow#stackTrace=true+jdk.MethodTrace#filter,file=%f.jfr")
+    public void jfrSyncEventSettings(TestProcess p) throws Exception {
+        p.waitForExit();
+        assert p.exitCode() == 0;
+
+        boolean found = false;
+        try (RecordingFile recordingFile = new RecordingFile(p.getFile("%f").toPath())) {
+            while (recordingFile.hasMoreEvents()) {
+                RecordedEvent event = recordingFile.readEvent();
+                if (event.getEventType().getName().equals("jdk.JavaExceptionThrow")
+                        && ExceptionThrow.MESSAGE.equals(event.getString("message"))) {
+                    if (p.test().nameSuffix().equals("withStackTrace")) {
+                        assert event.getStackTrace() != null;
+                        assert event.getStackTrace().toString().contains("test.jfr.ExceptionThrow.throwException");
+                    } else {
+                        assert event.getStackTrace() == null;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert found;
+    }
+
     /**
      * Test to validate time to safepoint profiling
      *
@@ -277,6 +306,34 @@ public class JfrTests {
             Assert.isGreater(ticksPerSec1, ticksPerSec2 * 0.95);
             Assert.isLess(ticksPerSec1, ticksPerSec2 * 1.05);
         }
+    }
+
+    private static void assertRateLimited(int actual, int limit, int duration) {
+        Assert.isLessOrEqual(actual, limit * (duration + 2));
+        Assert.isGreaterOrEqual(actual, limit * (duration - 2));
+    }
+
+    /**
+     * Rate limit categories are capped independently: the flood of CPU, allocation
+     * and span events largely exceeds the configured per-second limits.
+     */
+    @Test(mainClass = RateLimitApp.class, runIsolated = true)
+    public void rateLimit(TestProcess p) throws Exception {
+        p.profile("-e cpu -i 10ms --alloc 1k --ratelimit cpu:50,alloc:100,span:200 -d 4 -f %f.jfr");
+
+        Map<String, Integer> counts = new HashMap<>();
+        try (RecordingFile recordingFile = new RecordingFile(p.getFile("%f").toPath())) {
+            while (recordingFile.hasMoreEvents()) {
+                RecordedEvent event = recordingFile.readEvent();
+                counts.merge(event.getEventType().getName(), 1, Integer::sum);
+            }
+        }
+
+        int duration = 4;
+        assertRateLimited(counts.getOrDefault("jdk.ExecutionSample", 0), 50, duration);
+        assertRateLimited(counts.getOrDefault("jdk.ObjectAllocationInNewTLAB", 0) +
+                          counts.getOrDefault("jdk.ObjectAllocationOutsideTLAB", 0), 100, duration);
+        assertRateLimited(counts.getOrDefault("profiler.Span", 0), 200, duration);
     }
 
     private boolean containsSamplesOutsideWindow(TestProcess p) throws Exception {

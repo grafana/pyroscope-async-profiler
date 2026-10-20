@@ -61,3 +61,7 @@ async-profiler currently supports the following output formats:
 
 - `otlp` - OpenTelemetry protocol format for [profiling data](https://opentelemetry.io/blog/2024/profiling).
   Experimental feature: backward-incompatible changes may happen in future releases of async-profiler.
+  Besides writing to a local file, `otlp` profiles can be sent directly to an OpenTelemetry-compatible
+  endpoint: specify `http://` or `https://` URL instead of the file name, e.g.
+  `asprof --loop 60s -f http://localhost:4318 8983`.
+  If the URL does not specify a path, the default `/v1development/profiles` is used.

@@ -6,16 +6,13 @@
 #include <errno.h>
 #include <string.h>
 #include "asprof.h"
-#include "incbin.h"
+#include "httpClient.h"
 #include "javaApi.h"
 #include "os.h"
 #include "profiler.h"
 #include "threadLocalData.h"
 #include "tsc.h"
 #include "vmStructs.h"
-
-
-INCLUDE_HELPER_CLASS(SERVER_NAME, SERVER_CLASS, "one/profiler/Server")
 
 
 static void throwNew(JNIEnv* env, const char* exception_class, const char* message) {
@@ -90,7 +87,8 @@ Java_one_profiler_AsyncProfiler_execute0(JNIEnv* env, jobject unused, jstring co
 
     Log::open(args);
 
-    if (!args.hasOutputFile()) {
+    const char* file = args.hasOutputFile() ? args.file() : NULL;
+    if (file == NULL) {
         BufferWriter out;
         error = Profiler::instance()->runInternal(args, out);
         if (!error) {
@@ -101,20 +99,27 @@ Java_one_profiler_AsyncProfiler_execute0(JNIEnv* env, jobject unused, jstring co
             }
             return env->NewStringUTF(out.buf());
         }
+    } else if (Arguments::isUrl(file)) {
+        BufferWriter out;
+        error = Profiler::instance()->runInternal(args, out);
+        if (!error && (error = HttpClient::send(file, out.buf(), out.size(), args._output))) {
+            throwNew(env, "java/io/IOException", error.message());
+            return NULL;
+        }
     } else {
-        FileWriter out(args.file());
+        FileWriter out(file);
         if (!out.is_open()) {
             throwNew(env, "java/io/IOException", strerror(errno));
             return NULL;
         }
         error = Profiler::instance()->runInternal(args, out);
-        if (!error) {
-            return env->NewStringUTF("OK");
-        }
     }
 
-    throwNew(env, "java/lang/IllegalStateException", error.message());
-    return NULL;
+    if (error) {
+        throwNew(env, "java/lang/IllegalStateException", error.message());
+        return NULL;
+    }
+    return env->NewStringUTF("OK");
 }
 
 extern "C" DLLEXPORT jbyteArray JNICALL
@@ -136,7 +141,6 @@ Java_one_profiler_AsyncProfiler_execute1(JNIEnv* env, jobject unused, jstring co
     Log::open(args);
 
     BufferWriter out;
-    // TODO: This is doing one more copy than necessary, from ProtoWriter to BufferWriter
     error = Profiler::instance()->runInternal(args, out);
     if (error) {
         throwNew(env, "java/lang/IllegalStateException", error.message());
@@ -212,8 +216,6 @@ static const JNINativeMethod profiler_natives[] = {
     F(AsyncProfiler, setTraceId0,        "(JJ)V"),
 };
 
-static const JNINativeMethod* execute0 = &profiler_natives[2];
-
 static const JNINativeMethod recording_natives[] = {
     F(Recording, getThreadLocalBuffer, "()Ljava/nio/ByteBuffer;"),
     F(Recording, emitSpan,             "(JJLjava/lang/String;)V"),
@@ -250,26 +252,6 @@ void JavaAPI::registerNatives(jvmtiEnv* jvmti, JNIEnv* jni) {
     }
 
     jni->ExceptionClear();
-}
-
-bool JavaAPI::startHttpServer(jvmtiEnv* jvmti, JNIEnv* jni, const char* address) {
-    jclass handler = jni->FindClass("com/sun/net/httpserver/HttpHandler");
-    jobject loader;
-    if (handler != NULL && jvmti->GetClassLoader(handler, &loader) == 0) {
-        jclass cls = jni->DefineClass(SERVER_NAME, loader, (const jbyte*)SERVER_CLASS, INCBIN_SIZEOF(SERVER_CLASS));
-        if (cls != NULL && jni->RegisterNatives(cls, execute0, 1) == 0) {
-            jmethodID method = jni->GetStaticMethodID(cls, "start", "(Ljava/lang/String;)V");
-            if (method != NULL) {
-                jni->CallStaticVoidMethod(cls, method, jni->NewStringUTF(address));
-                if (!jni->ExceptionCheck()) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    jni->ExceptionDescribe();
-    return false;
 }
 
 
@@ -320,17 +302,30 @@ RecordingAPI::State RecordingAPI::registerNatives(JNIEnv* env, jclass recording_
     return Profiler::instance()->jfr()->active() ? RUNNING : STOPPED;
 }
 
-void RecordingAPI::bind(jvmtiEnv* jvmti, JNIEnv* env) {
-    jclass recording_class = env->FindClass("one/profiler/Recording");
-    if (recording_class == nullptr) {
-        env->ExceptionClear();
-        return;
+bool RecordingAPI::isRecordingClass(jvmtiEnv* jvmti, JNIEnv* env, jclass candidate) {
+    // Fast path: compare class name in place if possible
+    if (VMStructs::hasKlassField() && VMStructs::hasClassNames()) {
+        VMSymbol* name = VMKlass::fromJavaClass(env, candidate)->name();
+        return name != nullptr && name->length() == 22 && startsWith(name->body(), "one/profiler/Recording");
     }
 
+    char* name;
+    if (jvmti->GetClassSignature(candidate, &name, nullptr) == 0) {
+        bool result = streq(name, "Lone/profiler/Recording;");
+        jvmti->Deallocate((unsigned char*)name);
+        return result;
+    }
+    return false;
+}
+
+void RecordingAPI::bind(jvmtiEnv* jvmti, JNIEnv* env, jclass recording_class) {
     jint status;
     if (jvmti->GetClassStatus(recording_class, &status) == 0 && (status & JVMTI_CLASS_STATUS_INITIALIZED)) {
-        if (registerNatives(env, recording_class) == UNAVAILABLE) {
+        State state = registerNatives(env, recording_class);
+        if (state == UNAVAILABLE) {
             env->ExceptionClear();
+        } else {
+            env->SetStaticIntField(recording_class, _state_field, state);
         }
     }
 }

@@ -24,6 +24,7 @@ public class Arguments {
     public boolean help;
     public boolean reverse;
     public boolean inverted;
+    public boolean tree;
     public boolean diff;
     public boolean cpu;
     public boolean cpuTime;
@@ -46,7 +47,7 @@ public class Arguments {
     public long from;
     public long to;
     public long latency = -1;
-    public String tag;
+    public Pattern tag;
     public final List<String> files = new ArrayList<>();
 
     public Arguments(String... args) {

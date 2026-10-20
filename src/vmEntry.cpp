@@ -6,7 +6,6 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include "vmEntry.h"
 #include "arguments.h"
 #include "asprof.h"
@@ -104,14 +103,6 @@ static bool isOpenJ9JvmtiAlloc(const char* blob_name) {
 static bool isCompilerEntry(const char* blob_name) {
     return startsWith(blob_name, "_ZN8Compiler14compile_method") ||
            startsWith(blob_name, "_ZN10C2Compiler14compile_method");
-}
-
-static void* resolveMethodId(void** mid) {
-    return mid == NULL || *mid < (void*)4096 ? NULL : *mid;
-}
-
-static void* resolveMethodIdEnd() {
-    return NULL;
 }
 
 // Workaround for JDK-8308341: since JNI_GetCreatedJavaVMs may return an uninitialized JVM,
@@ -223,14 +214,6 @@ bool VM::init(JavaVM* vm, bool attach) {
         }
     }
 
-    if (!attach && hotspot_version() == 8 && OS::isLinux()) {
-        // Workaround for JDK-8185348
-        char* func = (char*)lib->findSymbol("_ZN6Method26checked_resolve_jmethod_idEP10_jmethodID");
-        if (func != NULL) {
-            applyPatch(func, (const char*)resolveMethodId, (const char*)resolveMethodIdEnd);
-        }
-    }
-
     if (attach) {
         ready();
     }
@@ -249,6 +232,13 @@ bool VM::init(JavaVM* vm, bool attach) {
     capabilities.can_generate_garbage_collection_events = 1;
     capabilities.can_tag_objects = 1;
     _jvmti->AddCapabilities(&capabilities);
+
+    // Request value object support if available (JDK 28+ / Valhalla).
+    // This is needed so that SampledObjectAlloc events are fired for value class instances.
+    // A separate call is to isolate unsupported capability on older JDKs.
+    jvmtiCapabilities value_caps = {0};
+    ((unsigned int*)&value_caps)[1] = 1u << 13;  // can_support_value_objects is bit 45
+    _jvmti->AddCapabilities(&value_caps);
 
     jvmtiEventCallbacks callbacks = {0};
     callbacks.VMInit = VMInit;
@@ -293,13 +283,11 @@ bool VM::init(JavaVM* vm, bool attach) {
         if (f != NULL && !f->get()) {
             _jvmti->SetHeapSamplingInterval(0);
         }
-        VM::releaseSampleObjectsCapability();
+        releaseSampleObjectsCapability();
     }
 
     if (attach) {
-        JNIEnv* env = jni();
-        RecordingAPI::bind(_jvmti, env);
-        loadAllMethodIDs(_jvmti, env);
+        loadAllMethodIDs(_jvmti, jni(), true);
         _jvmti->GenerateEvents(JVMTI_EVENT_DYNAMIC_CODE_GENERATED);
         _jvmti->GenerateEvents(JVMTI_EVENT_COMPILED_METHOD_LOAD);
     } else {
@@ -358,18 +346,6 @@ void VM::ready() {
     functions->RetransformClasses = RetransformClassesHook;
 }
 
-void VM::applyPatch(char* func, const char* patch, const char* end_patch) {
-    size_t size = end_patch - patch;
-    uintptr_t start_page = (uintptr_t)func & ~OS::page_mask;
-    uintptr_t end_page = ((uintptr_t)func + size + OS::page_mask) & ~OS::page_mask;
-
-    if (OS::mprotect((void*)start_page, end_page - start_page, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-        memcpy(func, patch, size);
-        __builtin___clear_cache(func, func + size);
-        OS::mprotect((void*)start_page, end_page - start_page, PROT_READ | PROT_EXEC);
-    }
-}
-
 void VM::loadMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni, jclass klass, bool update_count) {
     if (loadAcquire(_jmethod_id_count) > JMETHOD_ID_LIMIT) {
         if (__sync_bool_compare_and_swap(&_jmethod_id_count_warned, false, true)) {
@@ -402,12 +378,20 @@ void VM::loadMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni, jclass klass, bool update_c
     }
 }
 
-void VM::loadAllMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni) {
+void VM::loadAllMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni, bool bind_recording_api) {
     jint class_count;
     jclass* classes;
     if (jvmti->GetLoadedClasses(&class_count, &classes) == 0) {
         for (int i = 0; i < class_count; i++) {
             loadMethodIDs(jvmti, jni, classes[i]);
+        }
+        if (bind_recording_api) {
+            for (int i = 0; i < class_count; i++) {
+                if (RecordingAPI::isRecordingClass(jvmti, jni, classes[i])) {
+                    RecordingAPI::bind(jvmti, jni, classes[i]);
+                    break;
+                }
+            }
         }
         jvmti->Deallocate((unsigned char*)classes);
     }
@@ -415,16 +399,7 @@ void VM::loadAllMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni) {
 
 void JNICALL VM::VMInit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
     ready();
-    loadAllMethodIDs(jvmti, jni);
-
-    // Allow profiler server only at JVM startup
-    if (_global_args._server != NULL) {
-        if (JavaAPI::startHttpServer(jvmti, jni, _global_args._server)) {
-            Log::info("Profiler server started at %s", _global_args._server);
-        } else {
-            Log::error("Failed to start profiler server");
-        }
-    }
+    loadAllMethodIDs(jvmti, jni, false);
 
     // Delayed start of profiler if agent has been loaded at VM bootstrap
     if (!_global_args._preloaded) {

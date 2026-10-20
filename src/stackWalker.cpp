@@ -39,6 +39,14 @@ static inline uintptr_t defaultSenderSP(uintptr_t sp, uintptr_t fp) {
 #endif
 }
 
+static inline uintptr_t stackBottom() {
+    // For threads created with pthread_create(), control block is usually placed at the stack bottom.
+    // Exceptions are the main thread, threads with a user-provided stack, and threads made via raw clone().
+    uintptr_t tcb = (uintptr_t)pthread_self();
+    uintptr_t current_frame = (uintptr_t)&tcb;
+    return tcb - current_frame <= MAX_WALK_SIZE ? tcb : current_frame + MAX_WALK_SIZE;
+}
+
 static inline void fillFrame(ASGCT_CallFrame& frame, ASGCT_CallFrameType type, const char* name) {
     frame.bci = type;
     frame.method_id = (jmethodID)name;
@@ -66,7 +74,7 @@ int StackWalker::walkFP(void* ucontext, const void** callchain, int max_depth) {
     const void* pc;
     uintptr_t fp;
     uintptr_t sp;
-    uintptr_t bottom = (uintptr_t)&sp + MAX_WALK_SIZE;
+    uintptr_t bottom = stackBottom();
 
     StackFrame frame(ucontext);
     if (ucontext == NULL) {
@@ -115,7 +123,7 @@ int StackWalker::walkDwarf(void* ucontext, const void** callchain, int max_depth
     const void* pc;
     uintptr_t fp;
     uintptr_t sp;
-    uintptr_t bottom = (uintptr_t)&sp + MAX_WALK_SIZE;
+    uintptr_t bottom = stackBottom();
 
     StackFrame frame(ucontext);
     if (ucontext == NULL) {
@@ -208,7 +216,7 @@ int StackWalker::walkVM(void* ucontext, ASGCT_CallFrame* frames, int max_depth, 
     const void* pc;
     uintptr_t fp;
     uintptr_t sp;
-    uintptr_t bottom = (uintptr_t)&sp + MAX_WALK_SIZE;
+    uintptr_t bottom = stackBottom();
 
     StackFrame frame(ucontext ? ucontext : &empty_ucontext);
     if (ucontext == NULL) {
@@ -249,6 +257,7 @@ int StackWalker::walkVM(void* ucontext, ASGCT_CallFrame* frames, int max_depth, 
         if (details) {
             anchor = vm_thread->anchor();
         } else if (!vm_thread->anchor()->restoreFrame(pc, sp, fp)) {
+            crash_protection_ctx[lock_index] = NULL;
             return 0;
         }
     }
@@ -305,6 +314,11 @@ int StackWalker::walkVM(void* ucontext, ASGCT_CallFrame* frames, int max_depth, 
                         fillFrame(frames[depth++], FRAME_INTERPRETED, bci, method_id);
 
                         sp = ((uintptr_t*)fp)[InterpreterFrame::sender_sp_offset];
+                        if (sp < fp + 2 * sizeof(void*)) {
+                            // Stored sender_sp is the "unextended" SP, which can be less than SP
+                            // on AArch64 and RISC-V. Raw sender_sp is two words below FP.
+                            sp = fp + 2 * sizeof(void*);
+                        }
                         pc = stripPointer(((void**)fp)[FRAME_PC_SLOT]);
                         fp = *(uintptr_t*)fp;
                         continue;
@@ -369,8 +383,8 @@ int StackWalker::walkVM(void* ucontext, ASGCT_CallFrame* frames, int max_depth, 
                 fillFrame(frames[depth++], BCI_ERROR, "break_compiled");
                 break;
             } else if (nm->isEntryFrame(pc) && !features.mixed) {
-                JavaFrameAnchor* next_anchor = JavaFrameAnchor::fromEntryFrame(fp);
-                if (next_anchor == NULL) {
+                JavaFrameAnchor* next_anchor;
+                if (fp < sp || fp >= bottom || !aligned(fp) || (next_anchor = JavaFrameAnchor::fromEntryFrame(fp)) == NULL) {
                     fillFrame(frames[depth++], BCI_ERROR, "break_entry_frame");
                     break;
                 }
@@ -406,10 +420,14 @@ int StackWalker::walkVM(void* ucontext, ASGCT_CallFrame* frames, int max_depth, 
                     continue;
                 }
 
-                if (depth > 1 && nm->frameSize() > 0) {
+                if (nm->frameSize() > 0) {
                     sp += nm->frameSize() * sizeof(void*);
                     fp = ((uintptr_t*)sp)[-FRAME_PC_SLOT - 1];
                     pc = ((const void**)sp)[-FRAME_PC_SLOT];
+                    if (inDeadZone(pc)) {
+                        fillFrame(frames[depth++], BCI_ERROR, "break_stub");
+                        break;
+                    }
                     continue;
                 }
             }

@@ -72,7 +72,6 @@ enum SHORT_ENUM Clock {
 enum SHORT_ENUM Output {
     OUTPUT_NONE,
     OUTPUT_TEXT,
-    OUTPUT_SVG,  // obsolete
     OUTPUT_COLLAPSED,
     OUTPUT_FLAMEGRAPH,
     OUTPUT_TREE,
@@ -93,16 +92,17 @@ enum JfrOption {
 };
 
 // Keep this in sync with JfrSync.java
-enum EventMask {
-    EM_CPU          = 1,
-    EM_ALLOC        = 2,
-    EM_LOCK         = 4,
-    EM_WALL         = 8,
-    EM_NATIVEMEM    = 16,
-    EM_NATIVELOCK   = 32,
-    EM_METHOD_TRACE = 64
+enum EventCategory {
+    EC_CPU,         // jdk.ExecutionSample
+    EC_ALLOC,       // jdk.ObjectAllocationInNewTLAB, jdk.ObjectAllocationOutsideTLAB
+    EC_LOCK,        // jdk.JavaMonitorEnter, jdk.ThreadPark
+    EC_WALL,        // profiler.WallClockSample
+    EC_NATIVEMEM,   // profiler.Malloc, profiler.Free
+    EC_NATIVELOCK,  // profiler.NativeLock
+    EC_TRACE,       // jdk.MethodTrace
+    EC_SPAN,        // profiler.Span
+    EC_CATEGORIES
 };
-constexpr int EVENT_MASK_SIZE = 7;
 
 struct StackWalkFeatures {
     unsigned short stats         : 1;  // collect stack walking duration statistics
@@ -153,6 +153,8 @@ class Arguments {
 
     const char* expandFilePattern(const char* pattern);
 
+    bool parseRateLimit(char* str);
+
     static long long hash(const char* arg);
     static Output detectOutputFormat(const char* file);
     static int parseTimeout(const char* str);
@@ -180,8 +182,9 @@ class Arguments {
     const char* _log;
     const char* _loglevel;
     const char* _unknown_arg;
-    const char* _server;
-    const char* _filter;
+    bool _filter_enabled;
+    std::vector<const char*> _threads_include;
+    std::vector<const char*> _threads_exclude;
     std::vector<const char*> _include;
     std::vector<const char*> _exclude;
     unsigned char _mcache;
@@ -204,6 +207,7 @@ class Arguments {
     CStack _cstack;
     Clock _clock;
     Output _output;
+    int _rate_limit[EC_CATEGORIES];
     long _chunk_size;
     long _chunk_time;
     const char* _jfr_sync;
@@ -244,8 +248,9 @@ class Arguments {
         _log(NULL),
         _loglevel(NULL),
         _unknown_arg(NULL),
-        _server(NULL),
-        _filter(NULL),
+        _filter_enabled(false),
+        _threads_include(),
+        _threads_exclude(),
         _include(),
         _exclude(),
         _mcache(0),
@@ -280,7 +285,9 @@ class Arguments {
         _title(NULL),
         _minwidth(0),
         _reverse(false),
-        _inverted(false) {
+        _inverted(false)
+    {
+        for (int i = 0; i < EC_CATEGORIES; i++) _rate_limit[i] = -1;
     }
 
     ~Arguments();
@@ -303,14 +310,16 @@ class Arguments {
     }
 
     int eventMask() const {
-        return (_event      != NULL ? EM_CPU          : 0) |
-               (_alloc      >= 0    ? EM_ALLOC        : 0) |
-               (_lock       >= 0    ? EM_LOCK         : 0) |
-               (_wall       >= 0    ? EM_WALL         : 0) |
-               (_nativemem  >= 0    ? EM_NATIVEMEM    : 0) |
-               (_nativelock >= 0    ? EM_NATIVELOCK   : 0) |
-               (!_trace.empty()     ? EM_METHOD_TRACE : 0);
+        return (_event      != NULL ? 1 << EC_CPU        : 0) |
+               (_alloc      >= 0    ? 1 << EC_ALLOC      : 0) |
+               (_lock       >= 0    ? 1 << EC_LOCK       : 0) |
+               (_wall       >= 0    ? 1 << EC_WALL       : 0) |
+               (_nativemem  >= 0    ? 1 << EC_NATIVEMEM  : 0) |
+               (_nativelock >= 0    ? 1 << EC_NATIVELOCK : 0) |
+               (!_trace.empty()     ? 1 << EC_TRACE      : 0);
     }
+
+    static bool isUrl(const char* file);
 
     static long parseUnits(const char* str, const Multiplier* multipliers);
 };
